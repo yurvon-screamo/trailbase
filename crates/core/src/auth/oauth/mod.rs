@@ -26,5 +26,10 @@ pub fn oauth_router() -> OpenApiRouter<AppState> {
   return OpenApiRouter::new()
     .routes(routes!(list_providers::list_configured_providers_handler))
     .routes(routes!(login::login_with_external_auth_provider))
-    .routes(routes!(callback::callback_from_external_auth_provider));
+    .routes(routes!(
+      // GET redirect callback, e.g. used by Google or Yandex.
+      callback::callback_from_external_auth_provider,
+      // POST form callback for providers responding with `response_mode=form_post`, e.g. Apple.
+      callback::post_callback_from_external_auth_provider,
+    ));
 }

@@ -1,4 +1,4 @@
-use axum::extract::{Extension, Path, Query, State};
+use axum::extract::{Extension, Form, Path, Query, State};
 use axum::http::{self, HeaderName, HeaderValue, StatusCode};
 use axum::response::{AppendHeaders, IntoResponse, Redirect, Response};
 use chrono::Utc;
@@ -7,7 +7,7 @@ use oauth2::{AuthorizationCode, PkceCodeVerifier};
 use serde::Deserialize;
 use tower_cookies::Cookies;
 use trailbase_sqlite::{named_params, params};
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::AppState;
 use crate::auth::AuthError;
@@ -27,7 +27,7 @@ use crate::constants::{
 use crate::extract::HasRoot;
 use crate::rand::random_alphanumeric;
 
-#[derive(Debug, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct AuthQuery {
   pub code: String,
   pub state: String,
@@ -39,9 +39,13 @@ pub struct AuthQuery {
   get,
   path = "/oauth/{provider}/callback",
   tag = "auth",
-  params(AuthQuery),
+  params(
+    ("provider" = String, Path, description = "OAuth provider id."),
+    AuthQuery
+  ),
   responses(
-    (status = 200, description = "Redirect.")
+    (status = 303, description = "Redirect to the client-provided redirect URI."),
+    (status = 200, description = "Logged-in body if no redirect URI was provided.")
   )
 )]
 pub(crate) async fn callback_from_external_auth_provider(
@@ -49,6 +53,47 @@ pub(crate) async fn callback_from_external_auth_provider(
   Path(provider): Path<String>,
   Query(query): Query<AuthQuery>,
   Extension(HasRoot(has_root)): Extension<HasRoot>,
+  cookies: Cookies,
+) -> Result<Response, AuthError> {
+  return handle_external_oauth_callback(state, provider, query, has_root, cookies).await;
+}
+
+/// POST variant of the OAuth callback for providers that respond with
+/// `response_mode=form_post`, e.g. Apple: instead of redirecting with query parameters, the
+/// provider responds with an auto-submitting HTML form POSTing `code` and `state` to us.
+///
+/// NOTE: Apple additionally submits a one-time `user` payload (name) with the first
+/// authorization. It's currently ignored: user names aren't generally provided by OAuth
+/// providers, and mapping them into the user model is left as a follow-up (see the `oauth_scopes`
+/// TODO).
+#[utoipa::path(
+  post,
+  path = "/oauth/{provider}/callback",
+  tag = "auth",
+  params(
+    ("provider" = String, Path, description = "OAuth provider id.")
+  ),
+  request_body(content = AuthQuery, content_type = "application/x-www-form-urlencoded"),
+  responses(
+    (status = 303, description = "Redirect to the client-provided redirect URI."),
+    (status = 200, description = "Logged-in body if no redirect URI was provided.")
+  )
+)]
+pub(crate) async fn post_callback_from_external_auth_provider(
+  State(state): State<AppState>,
+  Path(provider): Path<String>,
+  Extension(HasRoot(has_root)): Extension<HasRoot>,
+  cookies: Cookies,
+  Form(query): Form<AuthQuery>,
+) -> Result<Response, AuthError> {
+  return handle_external_oauth_callback(state, provider, query, has_root, cookies).await;
+}
+
+async fn handle_external_oauth_callback(
+  state: AppState,
+  provider: String,
+  query: AuthQuery,
+  has_root: bool,
   cookies: Cookies,
 ) -> Result<Response, AuthError> {
   let auth_options = state.auth_options();
@@ -273,6 +318,15 @@ async fn get_or_create_user(
     .set_pkce_verifier(PkceCodeVerifier::new(server_pkce_code_verifier))
     .request_async(&ReqwestClient(&http_client))
     .await
+    .map_err(|err| {
+      // Not all providers respond with RFC-6749-compliant error bodies, so log the raw
+      // error for diagnostics before possibly falling back to the provider's custom parser.
+      log::warn!(
+        "OAuth token exchange with '{name}' failed: {err}",
+        name = provider.name()
+      );
+      return err;
+    })
     .or_else(|err| match err {
       oauth2::RequestTokenError::Parse(path, resp) => provider.parse_token_response(&path, &resp),
       err => Err(AuthError::FailedDependency(err.into())),

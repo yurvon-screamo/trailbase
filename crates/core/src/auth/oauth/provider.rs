@@ -71,6 +71,17 @@ pub trait OAuthProvider {
     AuthType::BasicAuth
   }
 
+  /// Whether the provider expects the authorization response to be delivered via
+  /// `response_mode=form_post`, i.e. the provider responds with an auto-submitting HTML form
+  /// POSTing `code` and `state` to our callback rather than redirecting with query parameters.
+  ///
+  /// For example, Apple requires `form_post` whenever user-info scopes like `name` or `email`
+  /// are requested:
+  /// https://developer.apple.com/documentation/signinwithapple/incorporating-sign-in-with-apple-into-other-platforms
+  fn uses_form_post_response_mode(&self) -> bool {
+    return false;
+  }
+
   fn settings(&self) -> Result<OAuthClientSettings, AuthError>;
 
   fn oauth_scopes(&self, user_identifier: UserIdentifier) -> Vec<String>;
