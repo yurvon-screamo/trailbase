@@ -169,6 +169,12 @@ impl OAuthProvider for AppleOAuthProvider {
     Self::DISPLAY_NAME
   }
 
+  fn auth_type(&self) -> oauth2::AuthType {
+    // Apple only accepts client credentials in the request body, not via HTTP Basic auth:
+    // https://developer.apple.com/documentation/signinwithapple/generate_and_validate_tokens
+    return oauth2::AuthType::RequestBody;
+  }
+
   fn uses_form_post_response_mode(&self) -> bool {
     // See the trait documentation: Apple requires form_post whenever user-info scopes are
     // requested and responds with an auto-submitting form POSTing to our callback handler.
@@ -240,6 +246,20 @@ async fn fetch_apple_public_keys(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn test_apple_auth_type_is_request_body() {
+    // Apple only accepts client credentials in the POST body, not HTTP Basic auth.
+    let provider = AppleOAuthProvider {
+      client_id: "12345".to_string(),
+      client_secret: "s3cre7".to_string(),
+    };
+
+    assert!(matches!(
+      provider.auth_type(),
+      oauth2::AuthType::RequestBody
+    ));
+  }
 
   #[test]
   fn test_apple_id_token_email_verified_deserialization() {

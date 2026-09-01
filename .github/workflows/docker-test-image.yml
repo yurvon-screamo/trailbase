@@ -1,0 +1,47 @@
+name: docker-test-image
+
+# Builds a linux/amd64 runtime image (same root Dockerfile as the official release
+# image) and pushes it to GHCR. Used to test the Apple `response_mode=form_post` fix
+# (#282) against a real deployment before opening a PR upstream.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/apple-formpost-image
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          echo "tags=${REGISTRY_IMAGE}:apple-formpost" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
