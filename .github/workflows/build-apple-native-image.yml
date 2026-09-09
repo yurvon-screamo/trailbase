@@ -25,10 +25,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout (full history, with submodules)
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          # Full history is required: the build stamps `last_executed_version`
+          # into metadata.textproto via git describe, and a shallow clone
+          # produces an unparseable version — the binary then refuses to
+          # start with Config(Invalid("failed to parse version")) (prod
+          # incident 2026-09-09).
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
