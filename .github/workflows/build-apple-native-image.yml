@@ -1,0 +1,64 @@
+name: build-apple-native-image
+
+# Builds the TrailBase fork image with the native Sign in with Apple
+# endpoint (branch apple-native-siwa) and pushes it to GHCR. The production
+# Railway service is image-based and pulls this tag during deploy (see the
+# origa runbook: serviceInstanceUpdate + serviceInstanceDeployV2).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [apple-native-siwa]
+    paths-ignore:
+      - "**.md"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:apple-native
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:apple-native-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print digests
+        run: |
+          curl -s "https://ghcr.io/v2/${IMAGE_NAME}/manifests/apple-native" \
+            -H "Authorization: Bearer $(echo "${GITHUB_TOKEN}" | base64 -d 2>/dev/null || true)" >/dev/null || true
+          echo "Pushed:"
+          echo "  ghcr.io/${IMAGE_NAME}:apple-native"
+          echo "  ghcr.io/${IMAGE_NAME}:apple-native-${GITHUB_SHA}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
