@@ -104,8 +104,20 @@ impl AppleOAuthProvider {
     &self,
     http_client: &reqwest::Client,
     id_token: &str,
-  ) -> Result<AppleIdToken, AuthError>
-  {
+  ) -> Result<AppleIdToken, AuthError> {
+    // Header first: malformed tokens are rejected before the JWKS fetch
+    // (outbound calls only for structurally valid tokens).
+    let header = jsonwebtoken::decode_header(id_token).map_err(|err| {
+      log::warn!("Apple id_token header could not be decoded: {err}");
+      return AuthError::FailedDependency(err.into());
+    })?;
+    if header.kid.is_none() {
+      log::warn!("Apple id_token is missing the kid header");
+      return Err(AuthError::FailedDependency(
+        "Missing kid in token header".into(),
+      ));
+    }
+
     // TODO: Should maybe cache the JWK responses.
     let public_keys = fetch_apple_public_keys(http_client).await?;
     return decode_id_token_with_keys(&public_keys, id_token, &self.client_id);
@@ -376,24 +388,27 @@ mod tests {
   }
 }
 
+/// Fixture shared by the native-verification tests here and the endpoint
+/// tests in `apple_native.rs`.
 #[cfg(test)]
-mod native_verification_tests {
+pub(crate) mod test_support {
   use super::*;
 
   /// RSA keypair generated offline (openssl genrsa 2048) standing in for
   /// Apple's signing key. The JWK components below (`n`, `e`) correspond to
   /// this private key, so test tokens signed here verify against a fixture
   /// `ApplePublicKeys` exactly like production tokens against Apple's JWKS.
-  const TEST_SIGNING_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDpJVIIFuAkQvTf\nUxobvsq9KfIZKUBB+vGI6XohqF5Ivf4/vWit+zdrm2EpwFJNVuomq+puUBrmRevM\npbHjiO6l3h691LvC7NW4gvMeEh9++00lqc6rjpDNIMDPtoHkuU6MZRiaiJGHH0pM\npX1/xNKRYV07+D8M4wwWGXCLnY8u2WiMdRhmNgb60SGilmWDWgGMLnY3vZWAJLuI\n/k9m1bPYPZxjfvf8HNFyrp62a1E6wFajYwFJkzWOvgORjMxkaPW+wwm0t+mhLUqr\nwQuxJ0sVANsoleooeXS9bF8zlIFMt0Hg0AZJ5qgpp9ScoeDINDTBUt2T2a2iggBW\nHMUfEU+XAgMBAAECggEARNpfNAFhd4QIoi1+H+SEJkJNe63JitLL4xWkmm0JTy1A\n+Vz8Hal7r/1GwBhKlgmNhBcwWByzHP9YSGtEskA9zmFfLcu2GbZs1Z1ipCZRA+S+\nX1mbLeIgFFxQZOduy/gH4QF4NycO51tPy3vyKLodP48EBFJneGxTJPGlYa4J25kL\n7wRjL4cm+HMHfYy29h0WcS5ZymQa+ZANfQl+jfMGHbM+rGMDDkcjl1XFKOEXyhU1\nhLF9enYdMTcTscVsv23chDP/YJUdWdEKV3QzY6jAYRkj9fbN4K6WcVZlhi+sn8r+\nD2UaF1HKDaGu/NFoWXHMx0y60kkhZnq2dYF9xPiGIQKBgQD20LNYRMtVy2NRfDrJ\n+xAKn6900Fj+LTk6HKcEKDd4JBY+n3Ii2MP5HvPn0w1Mf2EW8Rw4ibAKJu15mcbe\n0BwRIuu8wnaLvQaoiIKO5RoEhzvRYLWOxh6Nj/Vmtu85WVmw6Y6a+1h4C6PpQkv8\n3dWsBWszT0rf/19ip9M2yRXq4QKBgQDx0mWkbz1HEISH9NVoRGa2ZJDm38dniGwh\nPhz7X+3TQSrmR2W7N1SPrb1/rVax9lgeQOOIrCiCcNahkRCRMq2EJpdLZ4FaTsEp\nPnAjAGOKedRyXv8vMX0gQK3N+XwuVKDBFjeylL7bpr0WdZWVC6O6SYnYWaEAQwHa\njgH7Sv5BdwKBgQDZvcrKz343RURsidVvhW9kf/YRbxFjw8/dxZNOppAxDF0XiCDw\nPx289KKm3Vm5KBMmYzXLZyUH/8m3YoPA5AYu1Aj2sPRWWT+7hRrxJ4rpfci28cOa\nnowrxVnw8OhhRsNKwPGPJriox1Qmn9db0PUFWo51aLmcnbWv2nEKvyH34QKBgQCP\nhT+uCBdmRfdieXzvFSmgtq8JV2cRm3YRhLvOtXCBIPxFD7rhEkWtwH/ndwktNfe2\nfOyOAR9Jy46W9XHPuzQgaocAyb2Ly5H42IXVQDXTydq8xoTNjaGlsr10sc1x8eg2\nsOj9pCpiUuOGoOLWQsI5ncuiDA/yB9Lh08Z5Tlj4oQKBgFfWY4ymAI7LIB+QqYT3\nFuGhoj36dWC0zfE7MpNf9i0bB2IXtkaPvmQOGYY3xzf1AMV7iTwH8voPCPECoUFl\nlyJ4Vx66rC3or964SZ23+Bdr3KKxBver4aXvjJWLOO9Ow77bQT8ZOIPO8DCrByi0\nb0NLSP50ZEVOq0q09nlSfQQc\n-----END PRIVATE KEY-----";
-  const TEST_KEY_ID: &str = "test-apple-key-1";
-  const TEST_MODULUS: &str = "6SVSCBbgJEL031MaG77KvSnyGSlAQfrxiOl6IaheSL3-P71orfs3a5thKcBSTVbqJqvqblAa5kXrzKWx44jupd4evdS7wuzVuILzHhIffvtNJanOq46QzSDAz7aB5LlOjGUYmoiRhx9KTKV9f8TSkWFdO_g_DOMMFhlwi52PLtlojHUYZjYG-tEhopZlg1oBjC52N72VgCS7iP5PZtWz2D2cY373_BzRcq6etmtROsBWo2MBSZM1jr4DkYzMZGj1vsMJtLfpoS1Kq8ELsSdLFQDbKJXqKHl0vWxfM5SBTLdB4NAGSeaoKafUnKHgyDQ0wVLdk9mtooIAVhzFHxFPlw";
-  const TEST_EXPONENT: &str = "AQAB";
+  pub(crate) const TEST_SIGNING_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDpJVIIFuAkQvTf\nUxobvsq9KfIZKUBB+vGI6XohqF5Ivf4/vWit+zdrm2EpwFJNVuomq+puUBrmRevM\npbHjiO6l3h691LvC7NW4gvMeEh9++00lqc6rjpDNIMDPtoHkuU6MZRiaiJGHH0pM\npX1/xNKRYV07+D8M4wwWGXCLnY8u2WiMdRhmNgb60SGilmWDWgGMLnY3vZWAJLuI\n/k9m1bPYPZxjfvf8HNFyrp62a1E6wFajYwFJkzWOvgORjMxkaPW+wwm0t+mhLUqr\nwQuxJ0sVANsoleooeXS9bF8zlIFMt0Hg0AZJ5qgpp9ScoeDINDTBUt2T2a2iggBW\nHMUfEU+XAgMBAAECggEARNpfNAFhd4QIoi1+H+SEJkJNe63JitLL4xWkmm0JTy1A\n+Vz8Hal7r/1GwBhKlgmNhBcwWByzHP9YSGtEskA9zmFfLcu2GbZs1Z1ipCZRA+S+\nX1mbLeIgFFxQZOduy/gH4QF4NycO51tPy3vyKLodP48EBFJneGxTJPGlYa4J25kL\n7wRjL4cm+HMHfYy29h0WcS5ZymQa+ZANfQl+jfMGHbM+rGMDDkcjl1XFKOEXyhU1\nhLF9enYdMTcTscVsv23chDP/YJUdWdEKV3QzY6jAYRkj9fbN4K6WcVZlhi+sn8r+\nD2UaF1HKDaGu/NFoWXHMx0y60kkhZnq2dYF9xPiGIQKBgQD20LNYRMtVy2NRfDrJ\n+xAKn6900Fj+LTk6HKcEKDd4JBY+n3Ii2MP5HvPn0w1Mf2EW8Rw4ibAKJu15mcbe\n0BwRIuu8wnaLvQaoiIKO5RoEhzvRYLWOxh6Nj/Vmtu85WVmw6Y6a+1h4C6PpQkv8\n3dWsBWszT0rf/19ip9M2yRXq4QKBgQDx0mWkbz1HEISH9NVoRGa2ZJDm38dniGwh\nPhz7X+3TQSrmR2W7N1SPrb1/rVax9lgeQOOIrCiCcNahkRCRMq2EJpdLZ4FaTsEp\nPnAjAGOKedRyXv8vMX0gQK3N+XwuVKDBFjeylL7bpr0WdZWVC6O6SYnYWaEAQwHa\njgH7Sv5BdwKBgQDZvcrKz343RURsidVvhW9kf/YRbxFjw8/dxZNOppAxDF0XiCDw\nPx289KKm3Vm5KBMmYzXLZyUH/8m3YoPA5AYu1Aj2sPRWWT+7hRrxJ4rpfci28cOa\nnowrxVnw8OhhRsNKwPGPJriox1Qmn9db0PUFWo51aLmcnbWv2nEKvyH34QKBgQCP\nhT+uCBdmRfdieXzvFSmgtq8JV2cRm3YRhLvOtXCBIPxFD7rhEkWtwH/ndwktNfe2\nfOyOAR9Jy46W9XHPuzQgaocAyb2Ly5H42IXVQDXTydq8xoTNjaGlsr10sc1x8eg2\nsOj9pCpiUuOGoOLWQsI5ncuiDA/yB9Lh08Z5Tlj4oQKBgFfWY4ymAI7LIB+QqYT3\nFuGhoj36dWC0zfE7MpNf9i0bB2IXtkaPvmQOGYY3xzf1AMV7iTwH8voPCPECoUFl\nlyJ4Vx66rC3or964SZ23+Bdr3KKxBver4aXvjJWLOO9Ow77bQT8ZOIPO8DCrByi0\nb0NLSP50ZEVOq0q09nlSfQQc\n-----END PRIVATE KEY-----";
+  pub(crate) const TEST_KEY_ID: &str = "test-apple-key-1";
+  pub(crate) const TEST_MODULUS: &str = "6SVSCBbgJEL031MaG77KvSnyGSlAQfrxiOl6IaheSL3-P71orfs3a5thKcBSTVbqJqvqblAa5kXrzKWx44jupd4evdS7wuzVuILzHhIffvtNJanOq46QzSDAz7aB5LlOjGUYmoiRhx9KTKV9f8TSkWFdO_g_DOMMFhlwi52PLtlojHUYZjYG-tEhopZlg1oBjC52N72VgCS7iP5PZtWz2D2cY373_BzRcq6etmtROsBWo2MBSZM1jr4DkYzMZGj1vsMJtLfpoS1Kq8ELsSdLFQDbKJXqKHl0vWxfM5SBTLdB4NAGSeaoKafUnKHgyDQ0wVLdk9mtooIAVhzFHxFPlw";
+  pub(crate) const TEST_EXPONENT: &str = "AQAB";
 
-  const WEB_SERVICES_ID: &str = "net.uwuwu.origa.web";
-  const APP_ID: &str = "net.uwuwu.origa";
-  const NONCE_HASH: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+  pub(crate) const WEB_SERVICES_ID: &str = "net.uwuwu.origa.web";
+  pub(crate) const APP_ID: &str = "net.uwuwu.origa";
+  pub(crate) const NONCE_HASH: &str =
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
-  fn fixture_keys() -> ApplePublicKeys {
+  pub(crate) fn fixture_keys() -> ApplePublicKeys {
     return ApplePublicKeys {
       keys: vec![ApplePublicKey {
         kty: "RSA".to_string(),
@@ -406,7 +421,7 @@ mod native_verification_tests {
     };
   }
 
-  fn sign_token(claims: serde_json::Value) -> String {
+  pub(crate) fn sign_token(claims: serde_json::Value) -> String {
     let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_SIGNING_PEM.as_bytes()).unwrap();
     let header = jsonwebtoken::Header {
       alg: jsonwebtoken::Algorithm::RS256,
@@ -416,7 +431,7 @@ mod native_verification_tests {
     return jsonwebtoken::encode(&header, &claims, &key).unwrap();
   }
 
-  fn valid_claims() -> serde_json::Value {
+  pub(crate) fn valid_claims() -> serde_json::Value {
     return serde_json::json!({
       "iss": "https://appleid.apple.com",
       "aud": APP_ID,
@@ -428,6 +443,12 @@ mod native_verification_tests {
       "nonce": NONCE_HASH,
     });
   }
+}
+
+#[cfg(test)]
+mod native_verification_tests {
+  use super::test_support::*;
+  use super::*;
 
   #[test]
   fn well_formed_native_token_verifies() {
