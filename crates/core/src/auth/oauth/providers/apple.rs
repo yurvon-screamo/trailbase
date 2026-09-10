@@ -384,7 +384,10 @@ mod tests {
       native_client_id: None,
     };
 
-    assert!(matches!(provider.auth_type(), oauth2::AuthType::RequestBody));
+    assert!(matches!(
+      provider.auth_type(),
+      oauth2::AuthType::RequestBody
+    ));
   }
 }
 
