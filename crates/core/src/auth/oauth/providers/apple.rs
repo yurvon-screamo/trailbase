@@ -41,7 +41,7 @@ pub enum Boolean {
 }
 
 impl Boolean {
-  fn value(&self) -> bool {
+  pub(crate) fn value(&self) -> bool {
     return match self {
       Boolean::Bool(v) => *v,
       Boolean::String(s) if s.to_lowercase() == "true" => true,
@@ -384,7 +384,7 @@ mod tests {
       native_client_id: None,
     };
 
-    assert_eq!(oauth2::AuthType::RequestBody, provider.auth_type());
+    assert!(matches!(provider.auth_type(), oauth2::AuthType::RequestBody));
   }
 }
 
@@ -460,7 +460,7 @@ mod native_verification_tests {
       claims.email.as_deref(),
       Some("user@privaterelay.appleid.com")
     );
-    assert!(claims.email_verified);
+    assert!(claims.email_verified.is_some_and(|v| v.value()));
     assert_eq!(claims.nonce.as_deref(), Some(NONCE_HASH));
   }
 

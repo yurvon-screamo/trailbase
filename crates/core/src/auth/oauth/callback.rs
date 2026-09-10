@@ -17,9 +17,7 @@ use crate::auth::oauth::users::{create_user_for_external_provider, user_by_provi
 use crate::auth::options::OAuthEntry;
 use crate::auth::tokens::{FreshTokens, mint_new_tokens};
 use crate::auth::user::DbUser;
-use crate::auth::util::{
-  SameSite, new_cookie, remove_cookie, validate_and_normalize_username, validate_redirect,
-};
+use crate::auth::util::{SameSite, new_cookie, remove_cookie, validate_redirect};
 use crate::config::proto;
 use crate::constants::{
   AUTHORIZATION_CODE_TABLE, COOKIE_AUTH_TOKEN, COOKIE_OAUTH_STATE, COOKIE_REFRESH_TOKEN,
