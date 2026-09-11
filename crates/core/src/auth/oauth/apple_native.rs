@@ -34,7 +34,6 @@ use crate::auth::oauth::providers::apple::{
 };
 use crate::auth::oauth::users::{create_user_for_external_provider, user_by_provider_id};
 use crate::auth::tokens::{FreshTokens, mint_new_tokens};
-use crate::auth::user::DbUser;
 use crate::config::proto;
 
 /// Apple's provider name as configured in `auth.oauth_providers`.
@@ -76,7 +75,7 @@ pub struct AppleNativeTokenResponse {
     (status = 200, description = "Converts a verified identity token to auth tokens.", body = AppleNativeTokenResponse),
     (status = 400, description = "Malformed token or nonce mismatch."),
     (status = 401, description = "Token failed signature/issuer/audience/expiry verification."),
-    (status = 424, description = "First-time login without a (verified) email claim.")
+    (status = 424, description = "First-time login without a (verified) email claim under the configured user-identifier policy.")
   )
 )]
 pub(crate) async fn native_apple_login_handler(
@@ -122,25 +121,45 @@ where
   extract_kid(&request.identity_token)?;
 
   let public_keys = fetch_keys().await?;
+  // Signature, kid, issuer, audience and expiry failures all mean the
+  // presented token did not authenticate.
   let claims = decode_id_token_with_keys(&public_keys, &request.identity_token, &native_client_id)
-    .map_err(|_| {
-      // Signature, kid, issuer, audience and expiry failures all mean the
-      // presented token did not authenticate; details are logged inside
-      // `decode_id_token_with_keys`.
-      AuthError::Unauthorized
-    })?;
+    .map_err(|_| AuthError::Unauthorized)?;
   verify_nonce_claim(claims.nonce.as_deref(), &request.nonce)?;
 
-  let oauth_user = OAuthUser {
-    provider_user_id: claims.sub,
-    provider_id: proto::OAuthProviderId::Apple,
-    email: claims.email,
-    username: None,
-    verified: claims.email_verified.is_some_and(|v| v.value()),
-    avatar: None,
-  };
+  // Users are matched by Apple's team-stable `sub` — the same identity space
+  // as the web OAuth flow, so a web-created account and a native login resolve
+  // to the same account. Creation goes through the same user-identifier
+  // policy as the web flow.
+  let db_user = match user_by_provider_id(
+    state.user_conn(),
+    proto::OAuthProviderId::Apple,
+    claims.sub.clone(),
+  )
+  .await?
+  {
+    Some(existing_user) => existing_user,
+    None => {
+      let user_identifier = state
+        .access_config(|c| c.auth.user_identifier)
+        .and_then(|ui| ui.try_into().ok())
+        .unwrap_or(proto::UserIdentifier::Undefined);
 
-  let db_user = get_or_create_native_user(&state, oauth_user).await?;
+      create_user_for_external_provider(
+        state.user_conn(),
+        user_identifier,
+        OAuthUser {
+          provider_user_id: claims.sub,
+          provider_id: proto::OAuthProviderId::Apple,
+          email: claims.email,
+          username: None,
+          verified: claims.email_verified.is_some_and(|v| v.value()),
+          avatar: None,
+        },
+      )
+      .await?
+    }
+  };
 
   let (auth_token_ttl, refresh_token_ttl) = state.access_config(|c| c.auth.token_ttls());
   let FreshTokens {
@@ -167,52 +186,6 @@ where
   }));
 }
 
-/// Matches an Apple user by the team-stable `sub` and creates the account on
-/// first login. Email is only present in first-authorization tokens, so it is
-/// required (and must be verified) exactly when the user is new.
-async fn get_or_create_native_user(
-  state: &AppState,
-  oauth_user: OAuthUser,
-) -> Result<DbUser, AuthError> {
-  if let Some(existing_user) = user_by_provider_id(
-    state.user_conn(),
-    proto::OAuthProviderId::Apple,
-    oauth_user.provider_user_id.clone(),
-  )
-  .await?
-  {
-    return Ok(existing_user);
-  }
-
-  if oauth_user.email.is_none() {
-    return Err(AuthError::FailedDependency(
-      "missing email address: retry after revoking the app in Apple ID settings".into(),
-    ));
-  }
-  if !oauth_user.verified {
-    return Err(AuthError::FailedDependency(
-      "email address not verified".into(),
-    ));
-  }
-
-  let user_identifier = state
-    .access_config(|c| c.auth.user_identifier)
-    .and_then(|ui| ui.try_into().ok())
-    .unwrap_or(proto::UserIdentifier::Undefined);
-
-  let db_user =
-    create_user_for_external_provider(state.user_conn(), user_identifier, oauth_user).await?;
-
-  // This should never happen. We only ever create a new local user here for verified users.
-  if db_user.unverified_email.is_some() {
-    return Err(AuthError::Internal(
-      "OAuth users are expected to be verified".into(),
-    ));
-  }
-
-  return Ok(db_user);
-}
-
 #[cfg(test)]
 mod tests {
   use axum::Router;
@@ -225,9 +198,13 @@ mod tests {
     APP_ID, WEB_SERVICES_ID, fixture_keys, sign_token, valid_claims,
   };
 
-  async fn apple_state(native_client_id: Option<&str>) -> AppState {
+  async fn apple_state_with(
+    native_client_id: Option<&str>,
+    user_identifier: Option<proto::UserIdentifier>,
+  ) -> AppState {
     let mut config = proto::Config::new_with_custom_defaults();
     config.server.site_url = Some("https://example.org".to_string());
+    config.auth.user_identifier = user_identifier.map(|ui| ui as i32);
     config.auth.oauth_providers = [(
       APPLE_PROVIDER_NAME.to_string(),
       proto::OAuthProviderConfig {
@@ -245,6 +222,10 @@ mod tests {
     }))
     .await
     .unwrap();
+  }
+
+  async fn apple_state(native_client_id: Option<&str>) -> AppState {
+    return apple_state_with(native_client_id, None).await;
   }
 
   fn login_request(identity_token: &str, nonce: &str) -> AppleNativeLoginRequest {
@@ -320,8 +301,8 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn first_login_without_email_is_failed_dependency() {
-    let state = apple_state(Some(APP_ID)).await;
+  async fn first_login_without_email_is_failed_dependency_under_email_policy() {
+    let state = apple_state_with(Some(APP_ID), Some(proto::UserIdentifier::RequireEmail)).await;
 
     let mut claims = valid_claims();
     claims.as_object_mut().unwrap().remove("email");
@@ -334,6 +315,28 @@ mod tests {
     .await;
 
     assert!(matches!(result, Err(AuthError::FailedDependency(_))));
+  }
+
+  #[tokio::test]
+  async fn first_login_without_email_is_created_under_permissive_policy() {
+    // Without a user-identifier policy, the shared creation path behaves
+    // exactly like the web flow for a token without an email claim.
+    let state = apple_state(Some(APP_ID)).await;
+
+    let mut claims = valid_claims();
+    claims.as_object_mut().unwrap().remove("email");
+    claims.as_object_mut().unwrap().remove("email_verified");
+
+    let response = native_apple_login_impl(
+      state.clone(),
+      login_request(&sign_token(claims), "test"),
+      || async { Ok(fixture_keys()) },
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert!(!response.auth_token.is_empty());
   }
 
   #[tokio::test]
@@ -409,81 +412,60 @@ mod tests {
 
   #[tokio::test]
   async fn existing_apple_user_logs_in_without_email_claim() {
-    let state = test_state(None).await.unwrap();
+    let state = apple_state(Some(APP_ID)).await;
 
-    fn apple_user(email: Option<String>, verified: bool) -> OAuthUser {
-      return OAuthUser {
-        provider_user_id: format!(
-          "apple-sub-{}",
-          crate::rand::random_numeric_and_lowercase(10)
-        ),
-        provider_id: proto::OAuthProviderId::Apple,
-        email,
-        username: None,
-        verified,
-        avatar: None,
-      };
-    }
-
-    let created = get_or_create_native_user(
-      &state,
-      apple_user(Some("first@privaterelay.appleid.com".to_string()), true),
+    // First login: Apple includes the email claim only on first
+    // authorization.
+    let _first = native_apple_login_impl(
+      state.clone(),
+      login_request(&sign_token(valid_claims()), "test"),
+      || async { Ok(fixture_keys()) },
     )
     .await
     .unwrap();
 
-    // Repeat login: Apple sends no email claim for known users.
-    let repeat = OAuthUser {
-      provider_user_id: created.provider_user_id.clone().unwrap(),
-      provider_id: proto::OAuthProviderId::Apple,
-      email: None,
-      username: None,
-      verified: false,
-      avatar: None,
-    };
-    let user = get_or_create_native_user(&state, repeat).await.unwrap();
+    // Repeat login: no email claim, matched by the team-stable `sub`.
+    let mut claims = valid_claims();
+    claims.as_object_mut().unwrap().remove("email");
+    claims.as_object_mut().unwrap().remove("email_verified");
 
-    assert_eq!(user.id, created.id);
+    let response = native_apple_login_impl(
+      state.clone(),
+      login_request(&sign_token(claims), "test"),
+      || async { Ok(fixture_keys()) },
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert!(!response.auth_token.is_empty());
+
+    // The account still carries the email from the first authorization.
+    let db_user = user_by_provider_id(
+      state.user_conn(),
+      proto::OAuthProviderId::Apple,
+      "001234.abcdef.1234".to_string(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
-      user.email,
-      Some("first@privaterelay.appleid.com".to_string())
+      db_user.email.as_deref(),
+      Some("user@privaterelay.appleid.com")
     );
   }
 
   #[tokio::test]
-  async fn new_user_without_email_is_rejected() {
-    let state = test_state(None).await.unwrap();
-
-    let result = get_or_create_native_user(
-      &state,
-      OAuthUser {
-        provider_user_id: "apple-sub-new".to_string(),
-        provider_id: proto::OAuthProviderId::Apple,
-        email: None,
-        username: None,
-        verified: false,
-        avatar: None,
-      },
-    )
-    .await;
-
-    assert!(matches!(result, Err(AuthError::FailedDependency(_))));
-  }
-
-  #[tokio::test]
   async fn new_user_with_unverified_email_is_rejected() {
-    let state = test_state(None).await.unwrap();
+    let state = apple_state(Some(APP_ID)).await;
 
-    let result = get_or_create_native_user(
-      &state,
-      OAuthUser {
-        provider_user_id: "apple-sub-unverified".to_string(),
-        provider_id: proto::OAuthProviderId::Apple,
-        email: Some("unverified@example.com".to_string()),
-        username: None,
-        verified: false,
-        avatar: None,
-      },
+    let mut claims = valid_claims();
+    claims["email_verified"] = serde_json::json!(false);
+
+    let result = native_apple_login_impl(
+      state,
+      login_request(&sign_token(claims), "test"),
+      || async { Ok(fixture_keys()) },
     )
     .await;
 
