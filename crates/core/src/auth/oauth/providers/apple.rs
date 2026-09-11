@@ -105,19 +105,6 @@ impl AppleOAuthProvider {
     http_client: &reqwest::Client,
     id_token: &str,
   ) -> Result<AppleIdToken, AuthError> {
-    // Header first: malformed tokens are rejected before the JWKS fetch
-    // (outbound calls only for structurally valid tokens).
-    let header = jsonwebtoken::decode_header(id_token).map_err(|err| {
-      log::warn!("Apple id_token header could not be decoded: {err}");
-      return AuthError::FailedDependency(err.into());
-    })?;
-    if header.kid.is_none() {
-      log::warn!("Apple id_token is missing the kid header");
-      return Err(AuthError::FailedDependency(
-        "Missing kid in token header".into(),
-      ));
-    }
-
     // TODO: Should maybe cache the JWK responses.
     let public_keys = fetch_apple_public_keys(http_client).await?;
     return decode_id_token_with_keys(&public_keys, id_token, &self.client_id);
@@ -168,12 +155,9 @@ pub(crate) fn decode_id_token_with_keys(
   id_token: &str,
   audience: &str,
 ) -> Result<AppleIdToken, AuthError> {
-  let header = jsonwebtoken::decode_header(id_token).map_err(|err| {
-    log::warn!("Apple id_token header could not be decoded: {err}");
-    return AuthError::FailedDependency(err.into());
-  })?;
+  let header =
+    jsonwebtoken::decode_header(id_token).map_err(|err| AuthError::FailedDependency(err.into()))?;
   let Some(kid) = header.kid else {
-    log::warn!("Apple id_token is missing the kid header");
     return Err(AuthError::FailedDependency(
       "Missing kid in token header".into(),
     ));
@@ -181,7 +165,6 @@ pub(crate) fn decode_id_token_with_keys(
 
   // Find the key.
   let Some(public_key) = public_keys.keys.iter().find(|key| key.kid == kid) else {
-    log::warn!("Apple id_token kid '{kid}' not found in Apple's JWKs");
     return Err(AuthError::Unauthorized);
   };
 
@@ -193,11 +176,7 @@ pub(crate) fn decode_id_token_with_keys(
   validation.set_issuer(&["https://appleid.apple.com"]);
 
   let token_data = jsonwebtoken::decode::<AppleIdToken>(id_token, &decoding_key, &validation)
-    .map_err(|err| {
-      // Includes signature, audience, issuer, expiry and claims-deserialization errors.
-      log::warn!("Apple id_token verification failed: {err}");
-      return AuthError::FailedDependency(err.into());
-    })?;
+    .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
   return Ok(token_data.claims);
 }
